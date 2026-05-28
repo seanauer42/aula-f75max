@@ -56,37 +56,87 @@ static uint8_t seconds_to_delay_byte(double seconds) {
 }
 
 /*
- * Convert a single GIF frame's palette-indexed pixels to RGB565 LE,
- * writing directly into the stream at the given offset.
- *
- * GIF pixels are palette indices. Each index maps to an RGB triplet
- * in the colormap. We convert each triplet to 16-bit RGB565:
- *   bits 15-11: red   (5 bits, >> 3 from 8-bit)
- *   bits 10-5:  green (6 bits, >> 2 from 8-bit)
- *   bits 4-0:   blue  (5 bits, >> 3 from 8-bit)
- * Written little-endian: low byte first.
+   Composit one GIF frame onto the canvas buffer.
+
+   GIF frames can be delta frames -- they only contain pixels
+   that changed from the previous frame. Unchanged pixels
+   are left as palette index 0 (often the background or
+   transparent color).
+
+   We maintain a persistent canvas in RGBA and paint each frame's
+   pixels onto it at their declared posiiton (ImageDesc.Left/Top).
+   Transparent pixels (if the frame has a transparent index) are
+   skipped so the previous canvas shows through.
+
+   After compositing, we encode the full canvas to RGB565 into
+   the stream at the given offset.
  */
-static void write_frame_rgb565(uint8_t *stream, size_t offset,
-                                GifFileType *gif, int frame_idx) {
-    SavedImage *frame    = &gif->SavedImages[frame_idx];
-    ColorMapObject *cmap = frame->ImageDesc.ColorMap
-                         ? frame->ImageDesc.ColorMap
-                         : gif->SColorMap;
-    int total = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+static void composite_and_encode(
+    uint8_t *canvas_r, uint8_t *canvas_g, uint8_t *canvas_b,
+    uint8_t *stream, size_t stream_offset,
+    GifFileType *gif, int frame_idx)
+{
+    SavedImage *frame       = &gif->SavedImages[frame_idx];
+    ColorMapObject *cmap    = frame->ImageDesc.ColorMap
+                            ? frame->ImageDesc.ColorMap
+                            : gif->SColorMap;
+
+    int frame_left      = frame->ImageDesc.Left;
+    int frame_top       = frame->ImageDesc.Top;
+    int frame_width     = frame->ImageDesc.Width;
+    int frame_height    = frame->ImageDesc.Height;
+
+    /*
+       Find transparency index from Graphic Control Extension.
+       -1 means no transparency.
+     */
+    int transparent_idx = -1;
+    int e;
+    for (e = 0; e < frame->ExtensionBlockCount; e++) {
+        ExtensionBlock *eb = &frame->ExtensionBlocks[e];
+        if (eb->Function == GRAPHICS_EXT_FUNC_CODE && eb->ByteCount >= 4) {
+            if (eb->Bytes[0] & 0x01) /* Transparent flag set */
+                transparent_idx = (unsigned char)eb->Bytes[3];
+            break;
+        }
+    }
+
+    /* Paint frame pixels onto canvas, skipping transparent indices */
+    int fx, fy;
+    for (fy = 0; fy < frame_height; fy++) {
+        for (fx = 0; fx < frame_width; fx++) {
+            int canvas_x = frame_left + fx;
+            int canvas_y = frame_top + fy;
+
+            /* Skip pixels outside canvas bounds */
+            if (canvas_x < 0 || canvas_x >= DISPLAY_WIDTH ||
+                canvas_y < 0 || canvas_y >= DISPLAY_HEIGHT)
+                continue;
+
+            int raster_idx = fy * frame_width + fx;
+            uint8_t color_idx = (uint8_t)frame->RasterBits[raster_idx];
+
+            /* Skip transparent pixels -- canvas retains previous value */
+            if ((int)color_idx == transparent_idx)
+                continue;
+
+            GifColorType *color = &cmap->Colors[color_idx];
+            int canvas_pos = canvas_y * DISPLAY_WIDTH + canvas_x;
+            canvas_r[canvas_pos] = color->Red;
+            canvas_g[canvas_pos] = color->Green;
+            canvas_b[canvas_pos] = color->Blue;
+        }
+    }
+
+    /* Encode full canvas to RGB565 LE into stream */
     int i;
-
-    for (i = 0; i < total; i++) {
-        uint8_t idx         = (uint8_t)frame->RasterBits[i];
-        GifColorType *color = &cmap->Colors[idx];
-
-        uint16_t r = (uint16_t)(color->Red   >> 3);
-        uint16_t g = (uint16_t)(color->Green >> 2);
-        uint16_t b = (uint16_t)(color->Blue  >> 3);
-
+    for (i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT; i++) {
+        uint16_t r = (uint16_t)(canvas_r[i] >> 3);
+        uint16_t g = (uint16_t)(canvas_g[i] >> 2);
+        uint16_t b = (uint16_t)(canvas_b[i] >> 3);
         uint16_t pixel = (r << 11) | (g << 5) | b;
-
-        stream[offset + i * 2]     = (uint8_t)(pixel & 0xFF);  /* low byte */
-        stream[offset + i * 2 + 1] = (uint8_t)(pixel >> 8);    /* high byte */
+        stream[stream_offset + i * 2]     = (uint8_t)(pixel & 0xFF);
+        stream[stream_offset + i * 2 + 1] = (uint8_t)(pixel >> 8);
     }
 }
 
@@ -235,13 +285,44 @@ int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
         stream[1 + i] = seconds_to_delay_byte(delay_seconds);
     }
 
-    /* Write pixel data for each frame starting at offset HEADER_LEN */
-    for (i = 0; i < frame_count; i++) {
-        size_t frame_offset = HEADER_LEN + (size_t)i * FRAME_BYTES;
-        write_frame_rgb565(stream, frame_offset, gif, i);
+    /*
+       Allocate canvas buffers -- one byte per channel per pixel.
+       Initialized to the GIF background color if available.
+     */
+    int canvas_size = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+    uint8_t *canvas_r = calloc(canvas_size, 1);
+    uint8_t *canvas_g = calloc(canvas_size, 1);
+    uint8_t *canvas_b = calloc(canvas_size, 1);
+    if (!canvas_r || !canvas_g || !canvas_b) {
+        fprintf(stderr, "Out of memory for canvas\n");
+        free(canvas_r); free(canvas_g); free(canvas_b);
+        free(stream);
+        DGifCloseFile(gif, &gif_err);
+        return AULA_ERR_IO;
     }
 
-    DGifCloseFile(gif, &gif_err);
+    /* Seed canvas with GIF background color if colormap exists */
+    if (gif->SColorMap && gif->SBackGroundColor < gif->SColorMap->ColorCount) {
+        GifColorType *bg = &gif->SColorMap->Colors[gif->SBackGroundColor];
+        int i;
+        for (i = 0; i < canvas_size; i++) {
+            canvas_r[i] = bg->Red;
+            canvas_g[i] = bg->Green;
+            canvas_b[i] = bg->Blue;
+        }
+    }
+
+    /* Composite and encode each frame */
+    for (i = 0; i < frame_count; i++) {
+        size_t frame_offset = HEADER_LEN + (size_t)i * FRAME_BYTES;
+        composite_and_encode(canvas_r, canvas_g, canvas_b, stream,
+                                frame_offset, gif, i);
+    }
+
+    free(canvas_r);
+    free(canvas_g);
+    free(canvas_b);
+
 
     /* --- Send to device --- */
 
