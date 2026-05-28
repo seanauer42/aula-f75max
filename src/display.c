@@ -1,324 +1,322 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <gif_lib.h>
 #include "aula.h"
 
 /*
- * From our capture analysis:
+ * Stream format confirmed from OSX reference implementation:
  *
- * The display is 128x128 pixels, RGB565 encoded (2 bytes per pixel).
- * One full frame = 16384 pixels = 32768 bytes.
+ * Header (256 bytes, zero-padded):
+ *   [0]       = frameCount (uint8, max 255)
+ *   [1..N]    = per-frame delay, one byte each, in units of 1/500 second
+ *               (e.g. 0x32 = 50 = 100ms, matches GIF centisecond delay * 5)
+ *   [N+1..255]= zeros
  *
- * Each USB interrupt transfer carries 4096 bytes.
- * One GIF frame requires 8 USB transfers:
+ * Payload (frameCount * FRAME_BYTES):
+ *   Frames stored back to back, each FRAME_BYTES = 128*128*2 = 32768 bytes
+ *   Pixels are RGB565 little-endian (low byte first)
  *
- *   Transfer 0 (header):
- *     byte 0:		0xfb  (command byte: "image data incoming")
- *     bytes 1-251: 0x05  (padding)
- *     bytes 252-255: ff ff ff ff (start delimiter)
- *     bytes 256-4095: first 1920 pixels (3840 bytes
+ * Total stream is padded to a multiple of 4096 and sent in 4096-byte chunks.
+ * chunkCount = ceil((HEADER_LEN + frameCount * FRAME_BYTES) / CHUNK_LEN)
  *
- *   Transfers 1-6: 2048 pixels each (4096 bytes), pure pixel data
+ * Protocol sequence:
+ *   1. aula_cmd_exchange: 04 18 (enter config mode)
+ *   2. aula_cmd_exchange: 04 72 [slot] 00 00 00 00 00 [chunkCount_lo] [chunkCount_hi]
+ *   3. Read 128-byte ready signal from EP4 IN
+ *   4. For each 4096-byte chunk: interrupt OUT on EP3, read 128-byte ack on EP4
+ *   5. aula_cmd_exchange: 04 02 (commit)
  *
- *   Transfer 7 (tail):
- *     bytes 0-255: final 128 pixels (256 bytes)
- *     bytes 256-259: ff ff ff ff (end delimiter)
- *     bytes 260-4096: zeros
+ * Slot number (buf[2] of the 04:72 command) selects which display slot to write.
+ * Writing to an existing slot overwrites it. Default slot is 1.
  */
 
-#define USB_TRANSFER_LEN		4096
-#define HEADER_PAYLOAD_START	256
-#define HEADER_PAYLOAD_BYTES	(USB_TRANSFER_LEN - HEADER_PAYLOAD_START) /* 3840 */
-#define MIDDLE_PAYLOAD_BYTES 	USB_TRANSFER_LEN						  /* 4096 */
-#define TAIL_PAYLOAD_BYTES		256
-#define TRANSFERS_PER_FRAME		8
-#define FRAME_BYTES				(AULA_DISPLAY_PIXELS * 2) /* 32768 */
-#define RESPONSE_LEN 			128
-#define REQUEUE_LEN				64
-#define CMD_LEN					64
+#define DISPLAY_WIDTH  128
+#define DISPLAY_HEIGHT 128
+#define HEADER_LEN     256
+#define FRAME_BYTES    (DISPLAY_WIDTH * DISPLAY_HEIGHT * 2)  /* 32768 */
+#define CHUNK_LEN      4096
+#define CMD_LEN        64
+#define RESPONSE_LEN   128
+#define MAX_FRAMES     255
 
 /*
- * Convert a GIF frame to a flat RGB565 buffer.
- *
- * GIF uses a palette (colormap) -- each pixel is an index into a table
- * of RGB colors, not a direct color value. We look up each pixel's index
- * in the colormap and convert that RGB triplet to RGB565.
- *
- * RGB565 packs one pixel into 16 bits:
- *   bits 15-11: red   (5 bits)
- *   bits 10-5:  green (6 bits)
- *   bits 4-0:   blue  (5 bits)
- *
- * To convert 8-bit channel (0-255) to 5-bit (0-31): >> 3
- * To convert 8-bit channel (0-255) to 6-bit (0-63): >> 2
+ * Convert GIF delay (in seconds) to the device's delay unit.
+ * The device uses 1/500 second units, matching the OSX implementation.
+ * Minimum 1, maximum 255.
  */
-static void frame_to_rgb565(GifFileType *gif, int frame_idx, uint8_t *out) {
-	SavedImage *frame		= &gif->SavedImages[frame_idx];
-	ColorMapObject *cmap	= frame->ImageDesc.ColorMap
-							? frame->ImageDesc.ColorMap
-							: gif->SColorMap;
-	int width  = gif->SWidth;
-	int height = gif->SHeight;
-	int i;
-
-	for (i = 0; i < width * height; i++) {
-		uint8_t idx = (uint8_t)frame->RasterBits[i];
-		GifColorType *color = &cmap->Colors[idx];
-
-		uint16_t r = (uint16_t)(color->Red   >> 3);
-		uint16_t g = (uint16_t)(color->Green >> 2);
-		uint16_t b = (uint16_t)(color->Blue  >> 3);
-
-		uint16_t pixel = (r << 11) | (g << 5) | b;
-
-		/* Write little-endian: low byte first */
-		out[i * 2]     = (uint8_t)(pixel & 0xFF);
-		out[i * 2 + 1] = (uint8_t)(pixel >> 8);
-	}
-}
-
-/* read 64-byte ack and requeue */
-static int send_transfer(aula_device_t *dev, uint8_t *buf) {
-	uint8_t response[RESPONSE_LEN];
-	int transferred;
-	int ret;
-
-	/* Send 4096 bytes of pixel data */
-	ret = libusb_interrupt_transfer(
-		dev->handle,
-		AULA_EP_OUT,
-		buf,
-		USB_TRANSFER_LEN,
-		&transferred,
-		1000
-	);
-	if (ret < 0) {
-		fprintf(stderr, "OUT transfer failed: %s\n", libusb_strerror(ret));
-		return AULA_ERR_IO;
-	}
-
-	//printf("OUT transfer: ret=%d transferred=%d\n", ret, transferred);
-	fflush(stdout);
-
-	/* Read 64-byte (128?) device ack on EP4 IN
-	ret = libusb_interrupt_transfer(
-		dev->handle,
-		AULA_EP_IN,
-		response,
-		RESPONSE_LEN,
-		&transferred,
-		1000
-	);
-
-	/* Requeue zero-lenth IN transfer to keep EP4 ready */
-	ret = libusb_interrupt_transfer(
-		dev->handle,
-		AULA_EP_IN,
-		response,
-		REQUEUE_LEN,
-		&transferred,
-		100
-	);
-	/* timeout here is expected and fine */
-	if (ret < 0 && ret != LIBUSB_ERROR_TIMEOUT) {
-		fprintf(stderr, "IN ack failed: %s\n", libusb_strerror(ret));
-		return AULA_ERR_IO;
-	}
-	return AULA_OK;
+static uint8_t seconds_to_delay_byte(double seconds) {
+    if (seconds <= 0.0)
+        seconds = 0.01;
+    int value = (int)(seconds * 500.0 + 0.5);  /* round to nearest */
+    if (value < 1)   value = 1;
+    if (value > 255) value = 255;
+    return (uint8_t)value;
 }
 
 /*
- * Send preamble commands before GIF transfer.
- * frame_count tells the device how many frames are coming.
+ * Convert a single GIF frame's palette-indexed pixels to RGB565 LE,
+ * writing directly into the stream at the given offset.
+ *
+ * GIF pixels are palette indices. Each index maps to an RGB triplet
+ * in the colormap. We convert each triplet to 16-bit RGB565:
+ *   bits 15-11: red   (5 bits, >> 3 from 8-bit)
+ *   bits 10-5:  green (6 bits, >> 2 from 8-bit)
+ *   bits 4-0:   blue  (5 bits, >> 3 from 8-bit)
+ * Written little-endian: low byte first.
  */
-static int send_preamble(aula_device_t *dev, int frame_count, int slot) {
-	uint8_t buf[CMD_LEN];
-	//uint8_t response[RESPONSE_LEN];
-	//int transferred;
-	int ret;
-	int total_transfers = frame_count * TRANSFERS_PER_FRAME;
+static void write_frame_rgb565(uint8_t *stream, size_t offset,
+                                GifFileType *gif, int frame_idx) {
+    SavedImage *frame    = &gif->SavedImages[frame_idx];
+    ColorMapObject *cmap = frame->ImageDesc.ColorMap
+                         ? frame->ImageDesc.ColorMap
+                         : gif->SColorMap;
+    int total = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+    int i;
 
-	/* CMD 1: enter config mode */
-	memset(buf, 0, CMD_LEN);
-	buf[0] = 0x04;
-	buf[1] = 0x18;
-	ret = aula_cmd_exchange(dev, buf);
-	if (ret != AULA_OK) return ret;
+    for (i = 0; i < total; i++) {
+        uint8_t idx         = (uint8_t)frame->RasterBits[i];
+        GifColorType *color = &cmap->Colors[idx];
 
-	/* CMD 2: start GIF upload, send frame count */
-	memset(buf, 0, CMD_LEN);
-	buf[0] = 0x04;
-	buf[1] = 0x72;
-	buf[2] = (uint8_t)slot;
-	buf[8] = (uint8_t)(total_transfers & 0xFF);
-	buf[9] = (uint8_t)((total_transfers >> 8) & 0xFF);
-	ret = aula_cmd_exchange(dev, buf);
-	if (ret != AULA_OK) return ret;
+        uint16_t r = (uint16_t)(color->Red   >> 3);
+        uint16_t g = (uint16_t)(color->Green >> 2);
+        uint16_t b = (uint16_t)(color->Blue  >> 3);
 
-	/*
-	 * Wait for the device's "ready" signal on EP4 IN
-	*/
+        uint16_t pixel = (r << 11) | (g << 5) | b;
 
-	return AULA_OK;
+        stream[offset + i * 2]     = (uint8_t)(pixel & 0xFF);  /* low byte */
+        stream[offset + i * 2 + 1] = (uint8_t)(pixel >> 8);    /* high byte */
+    }
 }
 
 /*
- * Send postamble commit command after all frames sent.
+ * Send one 4096-byte chunk to the device and read the 128-byte ack.
+ * The device sends an ack after every chunk. If we don't read it,
+ * the endpoint buffer fills and the device stalls on the next chunk.
  */
-static int send_postamble(aula_device_t *dev) {
-	uint8_t buf[CMD_LEN];
-	memset(buf, 0, CMD_LEN);
-	buf[0] = 0x04;
-	buf[1] = 0x02;
-	return aula_cmd_exchange(dev, buf);
+static int send_chunk(aula_device_t *dev, const uint8_t *chunk) {
+    uint8_t response[RESPONSE_LEN];
+    int transferred;
+    int ret;
+
+    ret = libusb_interrupt_transfer(
+        dev->handle,
+        AULA_EP_OUT,
+        (uint8_t *)chunk,
+        CHUNK_LEN,
+        &transferred,
+        2000
+    );
+    if (ret < 0) {
+        fprintf(stderr, "Chunk OUT failed: %s\n", libusb_strerror(ret));
+        return AULA_ERR_IO;
+    }
+
+    ret = libusb_interrupt_transfer(
+        dev->handle,
+        AULA_EP_IN,
+        response,
+        RESPONSE_LEN,
+        &transferred,
+        200
+    );
+    if (ret < 0 && ret != LIBUSB_ERROR_TIMEOUT) {
+        fprintf(stderr, "Chunk ack failed: %s\n", libusb_strerror(ret));
+        return AULA_ERR_IO;
+    }
+
+    return AULA_OK;
 }
 
 /*
- * Send one complete display frame (128x128 RGB565) to the keyboard.
- * Splits the frame across 8 USB interrupt transfers in the format
- * the firmware expects.
- */
-static int send_frame(aula_device_t *dev, uint8_t *frame_rgb565) {
-	uint8_t transfer_buf[USB_TRANSFER_LEN];
-	int i;
-	int ret;
-
-	/* --- Transfer 0: header --- */
-	memset(transfer_buf, 0, USB_TRANSFER_LEN);
-	transfer_buf[0] = 0xfb; 					/* command byte */
-	memset(&transfer_buf[1], 0x05, 251);		/* padding */
-	transfer_buf[252] = 0xff;					/* start delimiter */
-	transfer_buf[253] = 0xff;
-	transfer_buf[254] = 0xff;
-	transfer_buf[255] = 0xff;
-
-
-	/* Copy first 3840 bytes of pixel data after the header */
-	memcpy(&transfer_buf[HEADER_PAYLOAD_START],
-			frame_rgb565,
-			HEADER_PAYLOAD_BYTES);
-
-	ret = send_transfer(dev, transfer_buf);
-	if (ret != AULA_OK) return ret;
-
-	/* --- Transfers 1-6: middle chunks --- */
-	for (i = 1; i < TRANSFERS_PER_FRAME - 1; i++) {
-		int offset = HEADER_PAYLOAD_BYTES + (i - 1) * USB_TRANSFER_LEN;
-		memcpy(transfer_buf, frame_rgb565 + offset, USB_TRANSFER_LEN);
-
-		ret = send_transfer(dev, transfer_buf);
-		if (ret != AULA_OK) return ret;
-	}
-
-	/* --- Transfer 7: tail --- */
-	memset(transfer_buf, 0, USB_TRANSFER_LEN);
-	memcpy(transfer_buf, frame_rgb565 + (FRAME_BYTES -
-			TAIL_PAYLOAD_BYTES),
-			TAIL_PAYLOAD_BYTES);
-
-	/* End delimiter */
-	transfer_buf[256] = 0xff;
-	transfer_buf[257] = 0xff;
-	transfer_buf[258] = 0xff;
-	transfer_buf[259] = 0xff;
-
-	return send_transfer(dev, transfer_buf);
-}
-
-/*
- * Public API: open a GIF file, decode each fram, send to display
- * Loops continuously until interrupted (Ctrl+C)
+ * Public API: decode a GIF and upload it to the keyboard display.
+ *
+ * path  - path to a 128x128 GIF file (animated or static)
+ * slot  - display slot to write (1-255), overwrites existing content
  */
 int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
-	int gif_err;
-	int ret = AULA_OK;
-	int i;
-	if (slot < 0) slot = 5;
+    int gif_err;
+    int ret = AULA_OK;
+    int i;
+    if (slot < 1)
+        slot = 1;
+    if (slot > 255)
+        slot = 255;
 
-	printf("Attempting first transfer...\n");
-	fflush(stdout);
+    /* --- Open and decode GIF --- */
+    GifFileType *gif = DGifOpenFileName(path, &gif_err);
+    if (!gif) {
+        fprintf(stderr, "Failed to open GIF '%s': %s\n",
+                path, GifErrorString(gif_err));
+        return AULA_ERR_IMAGE;
+    }
 
-	GifFileType *gif = DGifOpenFileName(path, &gif_err);
-	if (gif == NULL) {
-		fprintf(stderr, "Failed to open GIF '%s': %s\n",
-				path, GifErrorString(gif_err));
-		return AULA_ERR_IMAGE;
-	}
+    if (DGifSlurp(gif) != GIF_OK) {
+        fprintf(stderr, "Failed to decode GIF: %s\n",
+                GifErrorString(gif->Error));
+        DGifCloseFile(gif, &gif_err);
+        return AULA_ERR_IMAGE;
+    }
 
-	if (DGifSlurp(gif) != GIF_OK) {
-		fprintf(stderr, "Failed to decode GIF: %s\n",
-				GifErrorString(gif->Error));
-		DGifCloseFile(gif, &gif_err);
-		return AULA_ERR_IMAGE;
-	}
+    if (gif->SWidth != DISPLAY_WIDTH || gif->SHeight != DISPLAY_HEIGHT) {
+        fprintf(stderr, "GIF must be %dx%d pixels (got %dx%d)\n",
+                DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                gif->SWidth, gif->SHeight);
+        DGifCloseFile(gif, &gif_err);
+        return AULA_ERR_IMAGE;
+    }
 
-	/* Validate dimensions */
-	if (gif->SWidth != AULA_DISPLAY_WIDTH ||
-			gif->SHeight != AULA_DISPLAY_HEIGHT) {
-		fprintf(stderr, "GIF MUST be %dx%d pixels (got %dx%d)\n",
-				AULA_DISPLAY_WIDTH, AULA_DISPLAY_HEIGHT,
-				gif->SWidth, gif->SHeight);
-		DGifCloseFile(gif, &gif_err);
-		return AULA_ERR_IMAGE;
-	}
+    /*
+     * Cap frame count at MAX_FRAMES (255).
+     * The device uses a uint8 for frame count so 255 is the hard limit.
+     * The official software also enforces this.
+     */
+    int frame_count = gif->ImageCount;
+    if (frame_count > MAX_FRAMES) {
+        printf("GIF has %d frames, capping at %d.\n", frame_count, MAX_FRAMES);
+        frame_count = MAX_FRAMES;
+    }
 
-	/*
-	 * Allocate a buffer for one frame of RGB565 pixel data.
-	 * malloc returns a void* which C implicitely converts to
-	 * any pointer type -- no cast needed unlike C++.
-	 */
-	uint8_t *frame_buf = malloc(FRAME_BYTES);
-	if (frame_buf == NULL) {
-		fprintf(stderr, "Out of memory\n");
-		DGifCloseFile(gif, &gif_err);
-		return AULA_ERR_IO;
-	}
+    /* --- Build stream --- */
 
-	printf("Sending %d frame GIF to display slot %d...\n", gif->ImageCount, slot);
+    /*
+     * Total payload = 256-byte header + all frame pixel data.
+     * Padded to a multiple of CHUNK_LEN for transmission.
+     */
+    size_t payload_len = HEADER_LEN + (size_t)frame_count * FRAME_BYTES;
+    size_t chunk_count = (payload_len + CHUNK_LEN - 1) / CHUNK_LEN;
+    size_t stream_len  = chunk_count * CHUNK_LEN;
 
-	ret = send_preamble(dev, gif->ImageCount, 1);
-	if (ret != AULA_OK) goto cleanup;
+    uint8_t *stream = calloc(stream_len, 1);
+    if (!stream) {
+        fprintf(stderr, "Out of memory allocating %zu bytes\n", stream_len);
+        DGifCloseFile(gif, &gif_err);
+        return AULA_ERR_IO;
+    }
 
-	/*
-	 * Loop through frames continuously.
-	 * In a future version this will respect per-frame delay
-	 * from the GIF metadata. For now we send as fast as the
-	 * device accepts transfers.
-	*/
+    /*
+     * Header:
+     *   [0]     = frame count
+     *   [1..N]  = per-frame delay bytes
+     *
+     * Delay is read from GIF metadata for animated GIFs.
+     * For static GIFs (1 frame), a default of 100ms is used.
+     */
+    stream[0] = (uint8_t)frame_count;
 
-	for (i = 0; i < gif->ImageCount; i++) {
-		frame_to_rgb565(gif, i, frame_buf);
+    for (i = 0; i < frame_count; i++) {
+        double delay_seconds = 0.1;  /* default 100ms for static */
 
-		ret = send_frame(dev, frame_buf);
-		if (ret != AULA_OK) goto cleanup;
+        if (gif->ImageCount > 1) {
+            /*
+             * Read per-frame delay from GIF Graphic Control Extension.
+             * GIF stores delay in centiseconds (1/100 second).
+             * GCE layout (4 bytes after the packed flags byte):
+             *   [0] = packed flags
+             *   [1] = delay low byte  (centiseconds)
+             *   [2] = delay high byte (centiseconds)
+             *   [3] = transparent color index
+             */
+            SavedImage *frame = &gif->SavedImages[i];
+            int e;
+            for (e = 0; e < frame->ExtensionBlockCount; e++) {
+                ExtensionBlock *eb = &frame->ExtensionBlocks[e];
+                if (eb->Function == GRAPHICS_EXT_FUNC_CODE && eb->ByteCount >= 4) {
+                    uint16_t centiseconds = (uint16_t)eb->Bytes[1]
+                                          | ((uint16_t)eb->Bytes[2] << 8);
+                    if (centiseconds > 0)
+                        delay_seconds = centiseconds / 100.0;
+                    break;
+                }
+            }
+        }
 
-	   	/*
-		 * Simple progress bar.
-		 * \r returns to start of line without newline,
-		 * so each update overwrites the previous one.
-		 * fflush forces the output immediately since
-		 * stdout is line-buffered by default.
-		 */
-		printf("\rFrame %d/%d [",
-				i + 1, gif->ImageCount);
-		int bar_width = 40;
-		int filled = (i + 1) * bar_width / gif->ImageCount;
-		int j;
-		for (j = 0; j < bar_width; j++)
-			putchar(j < filled? '#' : '-');
+        stream[1 + i] = seconds_to_delay_byte(delay_seconds);
+    }
 
-		printf("] %.0f%%",
-				(float)(i + 1) / gif->ImageCount * 100.0f);
-		fflush(stdout);
-	}
+    /* Write pixel data for each frame starting at offset HEADER_LEN */
+    for (i = 0; i < frame_count; i++) {
+        size_t frame_offset = HEADER_LEN + (size_t)i * FRAME_BYTES;
+        write_frame_rgb565(stream, frame_offset, gif, i);
+    }
 
-	/* All frames sent successfully -- commit to display */
-	ret = send_postamble(dev);
+    DGifCloseFile(gif, &gif_err);
+
+    /* --- Send to device --- */
+
+    printf("Uploading %d frame GIF to slot %d (%zu chunks)...\n",
+           frame_count, slot, chunk_count);
+
+    /* CMD 1: enter config mode */
+    uint8_t buf[CMD_LEN];
+    memset(buf, 0, CMD_LEN);
+    buf[0] = 0x04;
+    buf[1] = 0x18;
+    ret = aula_cmd_exchange(dev, buf);
+    if (ret != AULA_OK) goto cleanup;
+
+    /*
+     * CMD 2: metadata
+     * buf[2]   = slot number (overwrites existing content)
+     * buf[8-9] = chunk count as little-endian uint16
+     */
+    memset(buf, 0, CMD_LEN);
+    buf[0] = 0x04;
+    buf[1] = 0x72;
+    buf[2] = (uint8_t)slot;
+    buf[8] = (uint8_t)(chunk_count & 0xFF);
+    buf[9] = (uint8_t)((chunk_count >> 8) & 0xFF);
+    ret = aula_cmd_exchange(dev, buf);
+    if (ret != AULA_OK) goto cleanup;
+
+    /*
+     * Wait for device ready signal on EP4 IN.
+     * After the metadata command the device sends 128 bytes indicating
+     * it is ready to receive pixel data. We must read this before
+     * sending chunks or the protocol is out of sync from the start.
+     */
+    /* I think this is wrong
+    {
+        uint8_t ready[RESPONSE_LEN];
+        int transferred;
+        libusb_interrupt_transfer(dev->handle, AULA_EP_IN,
+                                  ready, RESPONSE_LEN,
+                                  &transferred, 2000);
+    }
+    */
+
+    /* Send all chunks with progress bar */
+    for (i = 0; i < (int)chunk_count; i++) {
+        ret = send_chunk(dev, stream + (size_t)i * CHUNK_LEN);
+        if (ret != AULA_OK) goto cleanup;
+
+        /*
+         * Progress bar. \r returns to start of line without newline
+         * so each update overwrites the previous one.
+         * fflush forces output since stdout is line-buffered.
+         */
+        printf("\rChunk %d/%zu [", i, chunk_count);
+        int bar_width = 40;
+        int filled    = (int)((long)(i) * bar_width / (long)chunk_count);
+        int j;
+        for (j = 0; j < bar_width; j++)
+            putchar(j < filled ? '#' : '-');
+        printf("] %.0f%%", (float)(i) / (float)chunk_count * 100.0f);
+        fflush(stdout);
+
+        /* 40ms between chunks matches official software timing */
+        //usleep(40000);
+    }
+
+    /* CMD 3: commit */
+    memset(buf, 0, CMD_LEN);
+    buf[0] = 0x04;
+    buf[1] = 0x02;
+    ret = aula_cmd_exchange(dev, buf);
 
 cleanup:
-	printf("\n");
-	free(frame_buf);
-	DGifCloseFile(gif, &gif_err);
-	return ret;
+    printf("\n");
+    free(stream);
+    return ret;
 }

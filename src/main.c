@@ -23,6 +23,7 @@ static struct option long_opts[] = {
 	{ "minute", required_argument, NULL, 'm' },
 	{ "second", required_argument, NULL, 's' },
 	{ "reset",  no_argument,       NULL, 'R' },
+	{ "slot",   required_argument, NULL, 'S' },
 	{ "help",   no_argument,	   NULL, '?' },
 	{ NULL,     0,                 NULL,  0  } /* sentinel: marks end of table */
 };
@@ -91,6 +92,7 @@ int main(int argc, char *argv[]) {
 			case 'm': ov_min  = atoi(optarg); break;
 			case 's': ov_sec  = atoi(optarg); break;
 			case 'R': do_reset = 1;           break;
+			case 'S': slot = atoi(optarg);    break;
 			case '?':
 					  print_usage(argv[0]);
 					  return EXIT_SUCCESS;

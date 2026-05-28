@@ -92,15 +92,20 @@ CMakeFiles/aula-cli.dir/src/display.c.o: /home/archy/Coding/aula-f75max/src/disp
   /usr/include/alloca.h \
   /usr/include/bits/atomic_wide_counter.h \
   /usr/include/bits/byteswap.h \
+  /usr/include/bits/confname.h \
   /usr/include/bits/endian.h \
   /usr/include/bits/endianness.h \
+  /usr/include/bits/environments.h \
   /usr/include/bits/floatn-common.h \
   /usr/include/bits/floatn.h \
+  /usr/include/bits/getopt_core.h \
+  /usr/include/bits/getopt_posix.h \
   /usr/include/bits/libc-header-start.h \
   /usr/include/bits/local_lim.h \
   /usr/include/bits/long-double.h \
   /usr/include/bits/posix1_lim.h \
   /usr/include/bits/posix2_lim.h \
+  /usr/include/bits/posix_opt.h \
   /usr/include/bits/pthread_stack_min-dynamic.h \
   /usr/include/bits/pthread_stack_min.h \
   /usr/include/bits/pthreadtypes-arch.h \
@@ -139,6 +144,7 @@ CMakeFiles/aula-cli.dir/src/display.c.o: /home/archy/Coding/aula-f75max/src/disp
   /usr/include/bits/types/timer_t.h \
   /usr/include/bits/typesizes.h \
   /usr/include/bits/uintn-identity.h \
+  /usr/include/bits/unistd_ext.h \
   /usr/include/bits/waitflags.h \
   /usr/include/bits/waitstatus.h \
   /usr/include/bits/wchar.h \
@@ -163,6 +169,7 @@ CMakeFiles/aula-cli.dir/src/display.c.o: /home/archy/Coding/aula-f75max/src/disp
   /usr/include/sys/time.h \
   /usr/include/sys/types.h \
   /usr/include/time.h \
+  /usr/include/unistd.h \
   /usr/lib/gcc/x86_64-pc-linux-gnu/16.1.1/include/limits.h \
   /usr/lib/gcc/x86_64-pc-linux-gnu/16.1.1/include/stdarg.h \
   /usr/lib/gcc/x86_64-pc-linux-gnu/16.1.1/include/stdbool.h \
