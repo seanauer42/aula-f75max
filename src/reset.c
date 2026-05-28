@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include "aula.h"
 
 /*
@@ -93,6 +94,7 @@ static int send_zero_pages(aula_device_t *dev, int count) {
             fprintf(stderr, "Zero page %d failed: %s\n", i, libusb_strerror(ret));
             return AULA_ERR_IO;
         }
+        usleep(40000); /* probably unnecesary timeout */
     }
 
     memset(buf, 0, CMD_LEN);

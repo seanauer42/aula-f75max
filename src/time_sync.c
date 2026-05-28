@@ -32,12 +32,13 @@ int aula_sync_time(aula_device_t *dev, int year, int mon, int mday,
 	 * tm_year is years since 1900, tm_mon is 0-11 -- we convert
 	 * from human-friendly input to struct tm's internal representation.
 	 */
-	int use_year = (year != -1) ? year - 2000	: t->tm_year;
+	int use_year = (year != -1) ? year 	        : t->tm_year + 1900;
 	int use_mon	 = (mon  != -1) ? mon	 		: t->tm_mon + 1;
 	int use_mday = (mday != -1) ? mday			: t->tm_mday;
 	int use_hour = (hour != -1) ? hour			: t->tm_hour;
 	int use_min  = (min  != -1) ? min			: t->tm_min;
 	int use_sec  = (sec  != -1) ? sec			: t->tm_sec;
+	int use_wday = t->tm_wday;
 
 	/* --- Command 1: enter config mode --- */
 	memset(buf, 0, CMD_LEN);
@@ -60,22 +61,16 @@ int aula_sync_time(aula_device_t *dev, int year, int mon, int mday,
 	 * Fields we identified from the capture:
 	 *   [0]   = 0x00 packet type
 	 *   [1]   = 0x01 subcommand (am/pm?)
+	 *   [2]   = year - 2000
+	 *   [3]   = 0x1a
 	 * 	 [4]   = month
 	 * 	 [5]   = day
-	 * 	 [6]   = hour (by 12)
+	 * 	 [6]   = hour (24 hours)
 	 * 	 [7]   = minute
 	 * 	 [8]   = second
-	 * 	 [62]  = magic footer
-	 * 	 [63]  = magic footer
-	 *
-	 * struct tm stores:
-	 *   tm_year = years since 1900, to add 1900
-	 *   tm_mon  = 0-11, so add 1
-	 *   tm_hour = 0-23
-	 *   tm_min  = 0-59
-	 *   tm_sec  = 0-59
 	 */
 
+	memset(buf, 0, CMD_LEN);
 	buf[0]  = 0x00;
 	buf[1]  = 0x01;
 	buf[2]  = 0x5a; /* unknown -- constant in capture */
@@ -85,8 +80,9 @@ int aula_sync_time(aula_device_t *dev, int year, int mon, int mday,
 	buf[6]  = (uint8_t)use_hour;
 	buf[7]  = (uint8_t)use_min;
 	buf[8]  = (uint8_t)use_sec;
+	buf[10] = (uint8_t)use_wday;
 
-	buf[63] = 0xaa;
+	buf[62] = 0xaa;
 	buf[63] = 0x55;
 	ret = aula_cmd_exchange(dev, buf);
 	if (ret != AULA_OK) return ret;
@@ -107,13 +103,19 @@ int aula_sync_time(aula_device_t *dev, int year, int mon, int mday,
 	 *   timeout       - milliseconds before giving up
 	 */
 
+	memset(buf, 0, CMD_LEN);
+	buf[0] = 0x04;
+	buf[1] = 0x02;
+	ret = aula_cmd_exchange(dev, buf);
+	if (ret != AULA_OK) return ret;
+
 	printf("Time synced: %04d-%02d-%02d %02d:%02d:%02d\n",
-			t->tm_year + 2000,
-			t->tm_mon,
-			t->tm_mday,
-			t->tm_hour,
-			t->tm_min,
-			t->tm_sec
+	    use_year,
+		use_mon,
+		use_mday,
+		use_hour,
+		use_min,
+		use_sec
 	);
 
 	return AULA_OK;

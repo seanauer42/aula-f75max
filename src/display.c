@@ -98,7 +98,7 @@ static int send_transfer(aula_device_t *dev, uint8_t *buf) {
 		return AULA_ERR_IO;
 	}
 
-	printf("OUT transfer: ret=%d transferred=%d\n", ret, transferred);
+	//printf("OUT transfer: ret=%d transferred=%d\n", ret, transferred);
 	fflush(stdout);
 
 	/* Read 64-byte (128?) device ack on EP4 IN
@@ -132,10 +132,10 @@ static int send_transfer(aula_device_t *dev, uint8_t *buf) {
  * Send preamble commands before GIF transfer.
  * frame_count tells the device how many frames are coming.
  */
-static int send_preamble(aula_device_t *dev, int frame_count) {
+static int send_preamble(aula_device_t *dev, int frame_count, int slot) {
 	uint8_t buf[CMD_LEN];
-	uint8_t response[RESPONSE_LEN];
-	int transferred;
+	//uint8_t response[RESPONSE_LEN];
+	//int transferred;
 	int ret;
 	int total_transfers = frame_count * TRANSFERS_PER_FRAME;
 
@@ -150,7 +150,7 @@ static int send_preamble(aula_device_t *dev, int frame_count) {
 	memset(buf, 0, CMD_LEN);
 	buf[0] = 0x04;
 	buf[1] = 0x72;
-	buf[2] = 0x04;
+	buf[2] = (uint8_t)slot;
 	buf[8] = (uint8_t)(total_transfers & 0xFF);
 	buf[9] = (uint8_t)((total_transfers >> 8) & 0xFF);
 	ret = aula_cmd_exchange(dev, buf);
@@ -230,10 +230,11 @@ static int send_frame(aula_device_t *dev, uint8_t *frame_rgb565) {
  * Public API: open a GIF file, decode each fram, send to display
  * Loops continuously until interrupted (Ctrl+C)
  */
-int aula_send_gif(aula_device_t *dev, const char *path) {
+int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
 	int gif_err;
 	int ret = AULA_OK;
 	int i;
+	if (slot < 0) slot = 5;
 
 	printf("Attempting first transfer...\n");
 	fflush(stdout);
@@ -274,9 +275,9 @@ int aula_send_gif(aula_device_t *dev, const char *path) {
 		return AULA_ERR_IO;
 	}
 
-	printf("Sending %d frame GIF to display...\n", gif->ImageCount);
+	printf("Sending %d frame GIF to display slot %d...\n", gif->ImageCount, slot);
 
-	ret = send_preamble(dev, gif->ImageCount);
+	ret = send_preamble(dev, gif->ImageCount, 1);
 	if (ret != AULA_OK) goto cleanup;
 
 	/*

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h> /* for the timeout */
 #include "aula.h"
 
 #define CMD_LEN 64
@@ -148,7 +149,7 @@ int aula_cmd_exchange(aula_device_t *dev, uint8_t *buf) {
 			buf,
 			CMD_LEN,
 			1000
-			);
+	);
 	if (ret < 0) {
 		fprintf(stderr, "SET_REPORT failed: %s\n", libusb_strerror(ret));
 		return AULA_ERR_IO;
@@ -164,11 +165,16 @@ int aula_cmd_exchange(aula_device_t *dev, uint8_t *buf) {
 			response,
 			CMD_LEN,
 			1000
-			);
+	);
 	if (ret < 0) {
 		fprintf(stderr, "GET_REPORT failed: %s\n", libusb_strerror(ret));
 		return AULA_ERR_IO;
 	}
+	/*
+	    this seems unwarrented, but Claude wants to wait ~37ms
+		between commands
+	*/
+	//usleep(40000);
 	return AULA_OK;
 }
 

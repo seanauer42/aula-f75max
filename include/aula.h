@@ -43,7 +43,7 @@ int aula_open(aula_device_t *dev);
 void aula_close(aula_device_t *dev);
 
 // display.c
-int aula_send_gif(aula_device_t *dev, const char *path);
+int aula_send_gif(aula_device_t *dev, const char *path, int slot);
 
 int aula_cmd_exchange(aula_device_t *dev, uint8_t *buf);
 

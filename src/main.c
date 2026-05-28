@@ -59,6 +59,7 @@ int main(int argc, char *argv[]) {
 	 */
 	int ov_year = -1, ov_mon = -1, ov_mday = -1;
 	int ov_hour = -1, ov_min = -1, ov_sec  = -1;
+	int slot = -1;
 
 	/* --- Parse arguments --- */
 	int opt;
@@ -127,7 +128,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (do_gif) {
-		ret = aula_send_gif(&dev, gif_path);
+		ret = aula_send_gif(&dev, gif_path, slot);
 		if (ret != AULA_OK) {
 			aula_close(&dev);
 			return EXIT_FAILURE;
