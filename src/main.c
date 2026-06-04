@@ -130,20 +130,23 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (do_gif) {
-		ret = aula_send_gif(&dev, gif_path, slot);
+	    ret = aula_sync_time(&dev,
+				ov_year, ov_mon, ov_mday, ov_hour, ov_min, ov_sec);
+
+		ret = aula_send_gif(&dev, gif_path);
 		if (ret != AULA_OK) {
 			aula_close(&dev);
 			return EXIT_FAILURE;
 		}
 	}
 
-	if (do_reset) {
-		ret = aula_factory_reset(&dev);
-		if (ret != AULA_OK) {
-			aula_close(&dev);
-			return EXIT_FAILURE;
-		}
-	}
+	// if (do_reset) {
+		// ret = aula_factory_reset(&dev);
+		// if (ret != AULA_OK) {
+			// aula_close(&dev);
+			// return EXIT_FAILURE;
+		// }
+	// }
 
 	/* --- Clean up --- */
 	aula_close(&dev);

@@ -104,6 +104,8 @@ int aula_sync_time(aula_device_t *dev, int year, int mon, int mday,
 	 */
 
 	memset(buf, 0, CMD_LEN);
+	/* TODO: does buf empty out? */
+	printf(buf);
 	buf[0] = 0x04;
 	buf[1] = 0x02;
 	ret = aula_cmd_exchange(dev, buf);

@@ -185,14 +185,10 @@ static int send_chunk(aula_device_t *dev, const uint8_t *chunk) {
  * path  - path to a 128x128 GIF file (animated or static)
  * slot  - display slot to write (1-255), overwrites existing content
  */
-int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
+int aula_send_gif(aula_device_t *dev, const char *path) {
     int gif_err;
     int ret = AULA_OK;
     int i;
-    if (slot < 1)
-        slot = 1;
-    if (slot > 255)
-        slot = 255;
 
     /* --- Open and decode GIF --- */
     GifFileType *gif = DGifOpenFileName(path, &gif_err);
@@ -326,8 +322,8 @@ int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
 
     /* --- Send to device --- */
 
-    printf("Uploading %d frame GIF to slot %d (%zu chunks)...\n",
-           frame_count, slot, chunk_count);
+    printf("Uploading %d frame GIF (%zu chunks)...\n",
+           frame_count, chunk_count);
 
     /* CMD 1: enter config mode */
     uint8_t buf[CMD_LEN];
@@ -345,27 +341,11 @@ int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
     memset(buf, 0, CMD_LEN);
     buf[0] = 0x04;
     buf[1] = 0x72;
-    buf[2] = (uint8_t)slot;
+    buf[2] = 0x01;
     buf[8] = (uint8_t)(chunk_count & 0xFF);
     buf[9] = (uint8_t)((chunk_count >> 8) & 0xFF);
     ret = aula_cmd_exchange(dev, buf);
     if (ret != AULA_OK) goto cleanup;
-
-    /*
-     * Wait for device ready signal on EP4 IN.
-     * After the metadata command the device sends 128 bytes indicating
-     * it is ready to receive pixel data. We must read this before
-     * sending chunks or the protocol is out of sync from the start.
-     */
-    /* I think this is wrong
-    {
-        uint8_t ready[RESPONSE_LEN];
-        int transferred;
-        libusb_interrupt_transfer(dev->handle, AULA_EP_IN,
-                                  ready, RESPONSE_LEN,
-                                  &transferred, 2000);
-    }
-    */
 
     /* Send all chunks with progress bar */
     for (i = 0; i < (int)chunk_count; i++) {
@@ -391,12 +371,18 @@ int aula_send_gif(aula_device_t *dev, const char *path, int slot) {
     }
 
     /* CMD 3: commit */
+    /* Should I put this in the cleanup so that it always hits? */
     memset(buf, 0, CMD_LEN);
     buf[0] = 0x04;
     buf[1] = 0x02;
     ret = aula_cmd_exchange(dev, buf);
 
 cleanup:
+    // memset(buf, 0, CMD_LEN);
+    // buf[0] = 0x04;
+    // buf[1] = 0x02;
+    // ret = aula_cmd_exchange(dev, buf);
+
     printf("\n");
     free(stream);
     return ret;
