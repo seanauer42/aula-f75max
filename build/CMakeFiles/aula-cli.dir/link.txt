@@ -1,1 +1,0 @@
-/usr/bin/cc -Wl,--dependency-file=CMakeFiles/aula-cli.dir/link.d "CMakeFiles/aula-cli.dir/src/main.c.o" "CMakeFiles/aula-cli.dir/src/device.c.o" "CMakeFiles/aula-cli.dir/src/display.c.o" "CMakeFiles/aula-cli.dir/src/reset.c.o" "CMakeFiles/aula-cli.dir/src/time_sync.c.o" -o aula-cli  -lusb-1.0 /usr/lib/libgif.so

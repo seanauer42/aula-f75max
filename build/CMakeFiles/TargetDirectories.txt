@@ -1,7 +1,0 @@
-/home/archy/Coding/aula-f75max/build/CMakeFiles/aula-cli.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/edit_cache.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/rebuild_cache.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/list_install_components.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/install.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/install/local.dir
-/home/archy/Coding/aula-f75max/build/CMakeFiles/install/strip.dir
